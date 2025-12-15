@@ -94,13 +94,15 @@ class S3FD:
                 original_shapes.append((img.shape[1], img.shape[0]))  # (w, h)
 
                 # Do ALL preprocessing in numpy (matching original detect_faces exactly)
-                processed = img.copy()
-
-                # Resize if needed (use cv2, not torch)
+                # CRITICAL: Original ALWAYS does cv2.resize(), even at scale=1.0
+                # This normalizes array format (C-contiguous layout) for torch.from_numpy()
                 if scale != 1.0:
                     new_h = int(img.shape[0] * scale)
                     new_w = int(img.shape[1] * scale)
-                    processed = cv2.resize(processed, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    processed = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    # Even at scale 1.0, do resize to normalize array format (matches line 40-42 of detect_faces)
+                    processed = cv2.resize(img, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
 
                 # Match original preprocessing exactly (lines 43-48 of detect_faces method)
                 processed = np.swapaxes(processed, 1, 2)
