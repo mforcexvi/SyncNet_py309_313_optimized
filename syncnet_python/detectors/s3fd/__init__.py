@@ -112,8 +112,9 @@ class S3FD:
                 processed = processed[[2, 1, 0], :, :]  # RGB to BGR
                 processed = np.array(processed, dtype=np.float32)  # Force numpy + float32
 
-                # CRITICAL: Create numpy copy of img_mean to ensure it's not a tensor
-                img_mean_np = np.array(img_mean, dtype=np.float32)
+                # CRITICAL: Create fresh numpy array instead of using img_mean (which may be tensorized)
+                # Use the known values directly to avoid any tensor contamination
+                img_mean_np = np.array([104.0, 117.0, 123.0], dtype=np.float32)[:, np.newaxis, np.newaxis]
                 processed = processed - img_mean_np  # Explicit numpy subtraction
                 processed = np.array(processed, dtype=np.float32)  # Force numpy after subtraction
 
