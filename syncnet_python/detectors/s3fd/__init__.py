@@ -110,9 +110,8 @@ class S3FD:
                 processed -= img_mean  # Subtract mean (numpy operation)
                 processed = processed[[2, 1, 0], :, :]  # BGR back to RGB (numpy indexing)
 
-                # NOW convert to torch (matching line 49 of detect_faces)
-                # Ensure contiguous array before conversion
-                img_t = torch.from_numpy(np.ascontiguousarray(processed))
+                # NOW convert to torch (matching line 49 of detect_faces - no ascontiguousarray!)
+                img_t = torch.from_numpy(processed)
                 batch_tensors.append(img_t)
 
             # Stack on CPU then move to GPU (more memory efficient)
