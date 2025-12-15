@@ -112,7 +112,7 @@ class S3FD:
                 # RGB to BGR, normalize, and back to RGB (matching original code)
                 img_t = img_t[[2, 1, 0], :, :]  # RGB -> BGR
                 img_mean_tensor = torch.from_numpy(img_mean)
-                img_t -= torch.from_numpy(img_mean_tensor)
+                img_t -= img_mean_tensor
                 img_t = img_t[[2, 1, 0], :, :]  # BGR -> RGB
 
                 batch_tensors.append(img_t)
