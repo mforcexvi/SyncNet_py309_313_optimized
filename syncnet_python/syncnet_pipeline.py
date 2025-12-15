@@ -142,22 +142,24 @@ class SyncNetPipeline:
         areaB = (b[2] - b[0]) * (b[3] - b[1])
         return inter / (areaA + areaB - inter + 1e-8)
 
-    def _calculate_optimal_batch_size(self, frame_shape, target_memory_gb=2.0):
+    def _calculate_optimal_batch_size(self, frame_shape, target_memory_gb=1.0):
         """
         Calculate optimal batch size based on available GPU memory
 
         Args:
             frame_shape: (H, W, C) of detection frames
-            target_memory_gb: Max GPU memory to use for batch (conservative default)
+            target_memory_gb: Max GPU memory to use for batch (very conservative)
 
         Returns:
             Optimal batch size
         """
         if not torch.cuda.is_available():
-            return 16  # Default for CPU (reduced from 32)
+            return 8  # Default for CPU
 
         try:
-            # Clear cache and get fresh memory stats
+            # Clear cache multiple times to defragment
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
             gpu_props = torch.cuda.get_device_properties(0)
@@ -165,37 +167,48 @@ class SyncNetPipeline:
             allocated = torch.cuda.memory_allocated(0) / (1024**3)
             reserved = torch.cuda.memory_reserved(0) / (1024**3)
 
-            # Use reserved memory as baseline (accounts for S3FD model)
-            available = total_memory - reserved
+            # Calculate truly available memory
+            free_memory = total_memory - reserved
+
+            # Check for fragmentation
+            fragmented = reserved - allocated
+            if fragmented > 5.0:  # More than 5GB fragmented
+                logging.warning(
+                    f"High memory fragmentation detected: {fragmented:.2f}GB reserved but not allocated. "
+                    "Consider restarting the Python kernel."
+                )
 
             logging.info(
                 f"GPU Memory: {total_memory:.2f}GB total, "
-                f"{reserved:.2f}GB reserved, {available:.2f}GB available"
+                f"{allocated:.2f}GB allocated, {reserved:.2f}GB reserved, "
+                f"{free_memory:.2f}GB free, {fragmented:.2f}GB fragmented"
             )
 
             # Estimate memory per frame (input + feature maps)
+            # S3FD has multiple feature pyramid levels, very memory intensive
             h, w, c = frame_shape
             bytes_per_frame = h * w * c * 4  # float32
-            # S3FD feature maps are ~10-15x input size (more conservative estimate)
-            estimated_per_frame = bytes_per_frame * 15 / (1024**3)  # GB
+            # S3FD feature maps are actually 20-30x input size for large images
+            estimated_per_frame = bytes_per_frame * 30 / (1024**3)  # GB
 
-            # Use only 40% of available memory as safety margin (more conservative)
-            safe_memory = min(available * 0.4, target_memory_gb)
+            # Use only 20% of free memory (very conservative to avoid fragmentation)
+            safe_memory = min(free_memory * 0.2, target_memory_gb)
             optimal_batch = int(safe_memory / estimated_per_frame)
 
-            # Clamp between reasonable bounds (reduced max from 200 to 64)
-            batch_size = max(4, min(optimal_batch, 64))
+            # Clamp to very small batches to avoid OOM
+            batch_size = max(1, min(optimal_batch, 8))  # Max batch of 8, min of 1
 
             logging.info(
                 f"Calculated batch size: {batch_size} "
-                f"(estimated {estimated_per_frame*1024:.1f}MB per frame)"
+                f"(estimated {estimated_per_frame*1024:.1f}MB per frame, "
+                f"{batch_size * estimated_per_frame:.2f}GB total per batch)"
             )
 
             return batch_size
 
         except Exception as e:
-            logging.warning(f"Error calculating batch size: {e}, using default of 8")
-            return 8
+            logging.warning(f"Error calculating batch size: {e}, using default of 1")
+            return 1
 
     def _track(self, dets):
         cfg = self.cfg
