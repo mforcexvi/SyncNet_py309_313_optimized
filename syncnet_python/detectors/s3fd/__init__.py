@@ -93,26 +93,37 @@ class S3FD:
             for img in images_batch:
                 original_shapes.append((img.shape[1], img.shape[0]))  # (w, h)
 
-                # Do ALL preprocessing in numpy (matching original detect_faces exactly)
-                # CRITICAL: Original ALWAYS does cv2.resize(), even at scale=1.0
-                # This normalizes array format (C-contiguous layout) for torch.from_numpy()
+                # NEW APPROACH: Force numpy type after EVERY operation to prevent tensor conversion
                 if scale != 1.0:
                     new_h = int(img.shape[0] * scale)
                     new_w = int(img.shape[1] * scale)
                     processed = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
                 else:
-                    # Even at scale 1.0, do resize to normalize array format (matches line 40-42 of detect_faces)
+                    # Even at scale 1.0, do resize to normalize array format
                     processed = cv2.resize(img, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-                # Match original preprocessing exactly (lines 43-48 of detect_faces method)
+                # Force numpy after each operation to prevent accidental tensor conversion
                 processed = np.swapaxes(processed, 1, 2)
-                processed = np.swapaxes(processed, 1, 0)
-                processed = processed[[2, 1, 0], :, :]  # RGB to BGR (numpy indexing)
-                processed = processed.astype("float32")
-                processed -= img_mean  # Subtract mean (numpy operation)
-                processed = processed[[2, 1, 0], :, :]  # BGR back to RGB (numpy indexing)
+                processed = np.array(processed)  # Force numpy
 
-                # NOW convert to torch (matching line 49 of detect_faces - no ascontiguousarray!)
+                processed = np.swapaxes(processed, 1, 0)
+                processed = np.array(processed)  # Force numpy
+
+                processed = processed[[2, 1, 0], :, :]  # RGB to BGR
+                processed = np.array(processed, dtype=np.float32)  # Force numpy + float32
+
+                # CRITICAL: Create numpy copy of img_mean to ensure it's not a tensor
+                img_mean_np = np.array(img_mean, dtype=np.float32)
+                processed = processed - img_mean_np  # Explicit numpy subtraction
+                processed = np.array(processed, dtype=np.float32)  # Force numpy after subtraction
+
+                processed = processed[[2, 1, 0], :, :]  # BGR back to RGB
+                processed = np.array(processed, dtype=np.float32)  # Force numpy + float32
+
+                # Final type check before torch conversion
+                if not isinstance(processed, np.ndarray):
+                    raise TypeError(f"BUG: processed is {type(processed)}, expected np.ndarray!")
+
                 img_t = torch.from_numpy(processed)
                 batch_tensors.append(img_t)
 
