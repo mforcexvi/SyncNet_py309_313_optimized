@@ -68,7 +68,10 @@ class S3FD:
 
     def detect_faces_batch(self, images_batch, conf_th=0.8, scale=1.0):
         """
-        Batch face detection on GPU for improved performance
+        Batch face detection - FALLBACK to sequential processing
+
+        The batch preprocessing kept failing with mysterious tensor contamination.
+        Falling back to calling detect_faces() sequentially which is proven to work.
 
         Args:
             images_batch: List of numpy arrays [H, W, 3] in RGB
@@ -78,96 +81,14 @@ class S3FD:
         Returns:
             List of detection arrays [N, 5] for each image
         """
-        self.net.to(self.device)
-        self.net.eval()
-
         if not images_batch:
             return []
 
-        original_shapes = []
-
-        with torch.no_grad():
-            # Batch preprocessing - process on CPU first to save GPU memory
-            batch_tensors = []
-
-            for img in images_batch:
-                original_shapes.append((img.shape[1], img.shape[0]))  # (w, h)
-
-                # NEW APPROACH: Force numpy type after EVERY operation to prevent tensor conversion
-                if scale != 1.0:
-                    new_h = int(img.shape[0] * scale)
-                    new_w = int(img.shape[1] * scale)
-                    processed = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                else:
-                    # Even at scale 1.0, do resize to normalize array format
-                    processed = cv2.resize(img, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-                # Force numpy after each operation to prevent accidental tensor conversion
-                processed = np.swapaxes(processed, 1, 2)
-                processed = np.array(processed)  # Force numpy
-
-                processed = np.swapaxes(processed, 1, 0)
-                processed = np.array(processed)  # Force numpy
-
-                processed = processed[[2, 1, 0], :, :]  # RGB to BGR
-                processed = np.array(processed, dtype=np.float32)  # Force numpy + float32
-
-                # CRITICAL: Create fresh numpy array instead of using img_mean (which may be tensorized)
-                # Use the known values directly to avoid any tensor contamination
-                img_mean_np = np.array([104.0, 117.0, 123.0], dtype=np.float32)[:, np.newaxis, np.newaxis]
-                processed = processed - img_mean_np  # Explicit numpy subtraction
-                processed = np.array(processed, dtype=np.float32)  # Force numpy after subtraction
-
-                processed = processed[[2, 1, 0], :, :]  # BGR back to RGB
-                processed = np.array(processed, dtype=np.float32)  # Force numpy + float32
-
-                # Final type check before torch conversion
-                if not isinstance(processed, np.ndarray):
-                    raise TypeError(f"BUG: processed is {type(processed)}, expected np.ndarray!")
-
-                img_t = torch.from_numpy(processed)
-                batch_tensors.append(img_t)
-
-            # Stack on CPU then move to GPU (more memory efficient)
-            x_batch = torch.stack(batch_tensors)
-            del batch_tensors  # Free CPU memory
-
-            # Move to GPU just before inference
-            x_batch = x_batch.to(self.device)
-
-            # Single forward pass for entire batch
-            y = self.net(x_batch)
-
-            # Free input batch memory immediately
-            del x_batch
-
-            # Extract detections for each image in batch
-            all_detections = []
-            detections_batch = y.data
-
-            for i in range(len(images_batch)):
-                w, h = original_shapes[i]
-                scale_tensor = torch.Tensor([w, h, w, h]).to(self.device)
-                bboxes = np.empty(shape=(0, 5))
-
-                # Extract detections for this image
-                for det_idx in range(detections_batch.size(1)):
-                    j = 0
-                    while j < detections_batch.size(2) and detections_batch[i, det_idx, j, 0] > conf_th:
-                        score = detections_batch[i, det_idx, j, 0].item()
-                        pt = (detections_batch[i, det_idx, j, 1:] * scale_tensor).cpu().numpy()
-                        bbox = (pt[0], pt[1], pt[2], pt[3], score)
-                        bboxes = np.vstack((bboxes, bbox))
-                        j += 1
-
-                # Apply NMS
-                if len(bboxes) > 0:
-                    keep = nms_(bboxes, 0.1)
-                    bboxes = bboxes[keep]
-
-                all_detections.append(bboxes)
-
-            # Free detection results from GPU
-            del detections_batch, y
+        # FALLBACK: Just call detect_faces() for each image sequentially
+        # This is slower than true batching but at least it works
+        all_detections = []
+        for img in images_batch:
+            boxes = self.detect_faces(img, conf_th=conf_th, scales=[scale])
+            all_detections.append(boxes)
 
         return all_detections
