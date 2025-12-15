@@ -153,6 +153,112 @@ class SyncNetInstance(torch.nn.Module):
         # return offset.numpy(), conf.numpy(), minval.numpy()
         return int(offset), float(conf), float(minval)
 
+    def evaluate_from_memory(self, frames, audio, sample_rate, opt):
+        """
+        Evaluate sync from in-memory data (no disk I/O)
+        Optimized version of evaluate() that takes data directly
+
+        Args:
+            frames: List of numpy arrays [224, 224, 3] (BGR format from cv2)
+            audio: Numpy array of audio samples
+            sample_rate: Audio sample rate
+            opt: Options object with batch_size and vshift
+
+        Returns:
+            Tuple of (offset, conf, minval)
+        """
+        self.__S__.to(self.device)
+        self.__S__.eval()
+
+        # ========== ==========
+        # Process video frames
+        # ========== ==========
+
+        # Stack frames into tensor (same as file-based version lines 67-71)
+        im = numpy.stack(frames, axis=3)
+        im = numpy.expand_dims(im, axis=0)
+        im = numpy.transpose(im, (0, 3, 4, 1, 2))
+        imtv = torch.autograd.Variable(torch.from_numpy(im.astype(float)).float())
+
+        # ========== ==========
+        # Process audio
+        # ========== ==========
+
+        # Compute MFCC from audio array (same as lines 78-82)
+        mfcc = zip(*python_speech_features.mfcc(audio, sample_rate))
+        mfcc = numpy.stack([numpy.array(i) for i in mfcc])
+        cc = numpy.expand_dims(numpy.expand_dims(mfcc, axis=0), axis=0)
+        cct = torch.autograd.Variable(torch.from_numpy(cc.astype(float)).float())
+
+        # ========== ==========
+        # Check audio and video input length
+        # ========== ==========
+
+        if (float(len(audio)) / sample_rate) != (float(len(frames)) / 25):
+            print(
+                "WARNING: Audio (%.4fs) and video (%.4fs) lengths are different."
+                % (float(len(audio)) / sample_rate, float(len(frames)) / 25)
+            )
+
+        min_length = min(len(frames), math.floor(len(audio) / 640))
+
+        # ========== ==========
+        # Generate video and audio feats
+        # ========== ==========
+
+        lastframe = min_length - 5
+        im_feat = []
+        cc_feat = []
+
+        tS = time.time()
+        for i in range(0, lastframe, opt.batch_size):
+            im_batch = [
+                imtv[:, :, vframe : vframe + 5, :, :]
+                for vframe in range(i, min(lastframe, i + opt.batch_size))
+            ]
+            im_in = torch.cat(im_batch, 0).to(self.device)
+            im_out = self.__S__.forward_lip(im_in)
+            im_feat.append(im_out.data.cpu())
+
+            cc_batch = [
+                cct[:, :, :, vframe * 4 : vframe * 4 + 20]
+                for vframe in range(i, min(lastframe, i + opt.batch_size))
+            ]
+            cc_in = torch.cat(cc_batch, 0).to(self.device)
+            cc_out = self.__S__.forward_aud(cc_in)
+            cc_feat.append(cc_out.data.cpu())
+
+        im_feat = torch.cat(im_feat, 0)
+        cc_feat = torch.cat(cc_feat, 0)
+
+        # ========== ==========
+        # Compute offset
+        # ========== ==========
+
+        print("Compute time %.3f sec." % (time.time() - tS))
+
+        dists = calc_pdist(im_feat, cc_feat, vshift=opt.vshift)
+        mdist = torch.mean(torch.stack(dists, 1), 1)
+
+        minval, minidx = torch.min(mdist, 0)
+
+        offset = opt.vshift - minidx
+        conf = torch.median(mdist) - minval
+
+        fdist = numpy.stack([dist[minidx].numpy() for dist in dists])
+        fconf = torch.median(mdist).numpy() - fdist
+        fconfm = signal.medfilt(fconf, kernel_size=9)
+
+        numpy.set_printoptions(formatter={"float": "{: 0.3f}".format})
+        print("Framewise conf: ")
+        print(fconfm)
+        print(
+            "AV offset: \t%d \nMin dist: \t%.3f\nConfidence: \t%.3f"
+            % (offset, minval, conf)
+        )
+
+        return int(offset), float(conf), float(minval)
+
     def extract_feature(self, opt, videofile):
         self.__S__.eval()
         # ========== ==========

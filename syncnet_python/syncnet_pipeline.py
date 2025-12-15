@@ -54,6 +54,9 @@ class PipelineConfig:
     # Tools
     ffmpeg_bin: str = "ffmpeg"  # assumes ffmpeg in $PATH
     audio_sample_rate: int = 16000  # resample rate for speech
+
+    # Optimization flags
+    enable_scene_detection: bool = False  # Disable by default for performance
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -111,6 +114,39 @@ class SyncNetPipeline:
         areaB = (b[2] - b[0]) * (b[3] - b[1])
         return inter / (areaA + areaB - inter + 1e-8)
 
+    def _calculate_optimal_batch_size(self, frame_shape, target_memory_gb=4.0):
+        """
+        Calculate optimal batch size based on available GPU memory
+
+        Args:
+            frame_shape: (H, W, C) of detection frames
+            target_memory_gb: Max GPU memory to use for batch
+
+        Returns:
+            Optimal batch size
+        """
+        if not torch.cuda.is_available():
+            return 32  # Default for CPU
+
+        # Get available GPU memory
+        gpu_props = torch.cuda.get_device_properties(0)
+        total_memory = gpu_props.total_memory / (1024**3)  # GB
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+        available = total_memory - allocated
+
+        # Estimate memory per frame (input + feature maps)
+        h, w, c = frame_shape
+        bytes_per_frame = h * w * c * 4  # float32
+        # S3FD feature maps are ~5-8x input size
+        estimated_per_frame = bytes_per_frame * 8 / (1024**3)  # GB
+
+        # Use 70% of available memory as safety margin
+        safe_memory = min(available * 0.7, target_memory_gb)
+        optimal_batch = int(safe_memory / estimated_per_frame)
+
+        # Clamp between reasonable bounds
+        return max(8, min(optimal_batch, 200))
+
     def _track(self, dets):
         cfg = self.cfg
         tracks = []
@@ -143,19 +179,34 @@ class SyncNetPipeline:
                 ) > cfg.min_face_size:
                     tracks.append({"frame": full_f, "bbox": bb_i})
         return tracks
-    
+
+    def _smooth_track_boxes(self, track):
+        """
+        Extract and smooth bounding box parameters from track
+
+        Args:
+            track: Track dict with 'bbox' array
+
+        Returns:
+            Tuple of (s, x, y) smoothed arrays for size, x-center, y-center
+        """
+        s, x, y = [], [], []
+        for b in track["bbox"]:
+            s.append(max(b[3] - b[1], b[2] - b[0]) / 2)
+            x.append((b[0] + b[2]) / 2)
+            y.append((b[1] + b[3]) / 2)
+        # Apply median filter for smoothing
+        s, x, y = map(lambda v: signal.medfilt(v, 13), (s, x, y))
+        return s, x, y
+
     def _crop(self, track, frames, audio_wav, base):
         cfg = self.cfg
         base.parent.mkdir(parents=True, exist_ok=True)
         tmp_avi = f"{base}t.avi"
         vw = cv2.VideoWriter(tmp_avi, cv2.VideoWriter_fourcc(*"XVID"), cfg.frame_rate, (224, 224))
 
-        s, x, y = [], [], []
-        for b in track["bbox"]:
-            s.append(max(b[3] - b[1], b[2] - b[0]) / 2)
-            x.append((b[0] + b[2]) / 2)
-            y.append((b[1] + b[3]) / 2)
-        s, x, y = map(lambda v: signal.medfilt(v, 13), (s, x, y))
+        # Use helper for smoothing
+        s, x, y = self._smooth_track_boxes(track)
 
         for i, fidx in enumerate(track["frame"]):
             img = cv2.imread(frames[fidx])
@@ -215,6 +266,186 @@ class SyncNetPipeline:
         os.remove(tmp_avi)
         return final_avi
 
+    def _crop_streaming(self, track, video_path, audio_wav):
+        """
+        Create cropped frames in memory without writing intermediate files
+        Optimized version that avoids disk I/O
+
+        Args:
+            track: Track dict with 'frame' and 'bbox' arrays
+            video_path: Path to source video
+            audio_wav: Path to audio file
+
+        Returns:
+            Dict with 'frames' (list of 224x224 numpy arrays) and 'audio' (numpy array)
+        """
+        from scipy.io import wavfile
+
+        cfg = self.cfg
+
+        # Smooth bounding boxes using helper
+        s, x, y = self._smooth_track_boxes(track)
+
+        # Stream video and crop frames in memory
+        cap = cv2.VideoCapture(str(video_path))
+        cropped_frames = []
+
+        for i, fidx in enumerate(track["frame"]):
+            # Seek to specific frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ret, img = cap.read()
+            if not ret:
+                continue
+
+            # Crop using smoothed bounding box (same logic as _crop)
+            bs = s[i]
+            cs = cfg.crop_scale
+            pad = int(bs * (1 + 2 * cs))
+            img_p = cv2.copyMakeBorder(
+                img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(110, 110, 110)
+            )
+            my, mx = y[i] + pad, x[i] + pad
+            y1, y2 = int(my - bs), int(my + bs * (1 + 2 * cs))
+            x1, x2 = int(mx - bs * (1 + cs)), int(mx + bs * (1 + cs))
+            crop = cv2.resize(img_p[y1:y2, x1:x2], (224, 224))
+
+            cropped_frames.append(crop)
+
+        cap.release()
+
+        # Slice audio once in memory (no temp file)
+        ss = track["frame"][0] / cfg.frame_rate
+        to = (track["frame"][-1] + 1) / cfg.frame_rate
+
+        # Load audio directly into memory
+        sample_rate, full_audio = wavfile.read(str(audio_wav))
+        start_sample = int(ss * sample_rate)
+        end_sample = int(to * sample_rate)
+        sliced_audio = full_audio[start_sample:end_sample]
+
+        return {
+            'frames': cropped_frames,
+            'audio': sliced_audio,
+            'sample_rate': sample_rate
+        }
+
+    def _detect_faces_streaming(self, video_path):
+        """
+        Stream video and detect faces without writing frames to disk
+        Uses GPU batch processing for improved performance
+
+        Args:
+            video_path: Path to input video
+
+        Returns:
+            List of detections per frame (same format as file-based method)
+        """
+        cfg = self.cfg
+        cap = cv2.VideoCapture(str(video_path))
+
+        # Get video dimensions for batch size calculation
+        ret, first_frame = cap.read()
+        if not ret:
+            cap.release()
+            return []
+
+        # Calculate downscaled dimensions
+        h, w = first_frame.shape[:2]
+        detection_h = int(h * cfg.facedet_scale)
+        detection_w = int(w * cfg.facedet_scale)
+
+        # Calculate optimal batch size based on GPU memory
+        batch_size = self._calculate_optimal_batch_size((detection_h, detection_w, 3))
+        logging.info(f"Using batch size {batch_size} for face detection")
+
+        # Reset to beginning
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        detections = []
+        frame_buffer = []
+        frame_indices = []
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Resize to detection scale
+            detection_frame = cv2.resize(
+                frame,
+                (detection_w, detection_h),
+                interpolation=cv2.INTER_LINEAR
+            )
+
+            # Convert BGR to RGB
+            detection_frame_rgb = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2RGB)
+
+            frame_buffer.append(detection_frame_rgb)
+            frame_indices.append(frame_idx)
+            frame_idx += 1
+
+            # Process batch when full or at end
+            if len(frame_buffer) >= batch_size:
+                # Batch detection
+                if hasattr(self.s3fd, 'detect_faces_batch'):
+                    boxes_batch = self.s3fd.detect_faces_batch(
+                        frame_buffer,
+                        conf_th=0.9,
+                        scale=1.0  # Already downscaled
+                    )
+                else:
+                    # Fallback to sequential detection
+                    boxes_batch = [
+                        self.s3fd.detect_faces(img, conf_th=0.9, scales=[1.0])
+                        for img in frame_buffer
+                    ]
+
+                # Scale boxes back to original resolution and store
+                for fidx, boxes in zip(frame_indices, boxes_batch):
+                    if len(boxes) > 0:
+                        boxes_scaled = boxes.copy()
+                        boxes_scaled[:, :4] /= cfg.facedet_scale
+
+                        detections.append([
+                            {"frame": fidx, "bbox": b[:-1].tolist(), "conf": float(b[-1])}
+                            for b in boxes_scaled
+                        ])
+                    else:
+                        detections.append([])
+
+                frame_buffer = []
+                frame_indices = []
+
+        # Process remaining frames
+        if frame_buffer:
+            if hasattr(self.s3fd, 'detect_faces_batch'):
+                boxes_batch = self.s3fd.detect_faces_batch(
+                    frame_buffer,
+                    conf_th=0.9,
+                    scale=1.0
+                )
+            else:
+                boxes_batch = [
+                    self.s3fd.detect_faces(img, conf_th=0.9, scales=[1.0])
+                    for img in frame_buffer
+                ]
+
+            for fidx, boxes in zip(frame_indices, boxes_batch):
+                if len(boxes) > 0:
+                    boxes_scaled = boxes.copy()
+                    boxes_scaled[:, :4] /= cfg.facedet_scale
+
+                    detections.append([
+                        {"frame": fidx, "bbox": b[:-1].tolist(), "conf": float(b[-1])}
+                        for b in boxes_scaled
+                    ])
+                else:
+                    detections.append([])
+
+        cap.release()
+        return detections
+
     # ---------------------------- inference -------------------------------- #
     def inference(
         self,
@@ -229,27 +460,11 @@ class SyncNetPipeline:
             work.mkdir(parents=True, exist_ok=True)
 
         try:
-            # 1) Convert video to constant-fps AVI
-            avi = work / "video.avi"
-            (
-                ffmpeg.input(video_path)
-                .output(str(avi), **{"q:v": 2}, r=cfg.frame_rate, **{"async": 1})
-                .overwrite_output()
-                .run()
-            )
+            # 1-4) OPTIMIZED: Streaming face detection (replaces AVI conversion, frame extraction, and face detection)
+            logging.info("Using optimized streaming pipeline (no disk I/O for frames)")
+            detections = self._detect_faces_streaming(video_path)
 
-            # 2) Extract frames
-            frames_dir = work / "frames"
-            frames_dir.mkdir(exist_ok=True)
-            (
-                ffmpeg.input(str(avi))
-                .output(str(frames_dir / "%06d.jpg"), **{"q:v": 2}, f="image2", threads=1)
-                .overwrite_output()
-                .run()
-            )
-            frames = sorted(glob(str(frames_dir / "*.jpg")))
-
-            # 3) Resample speech
+            # Keep audio resampling (still needed, but fast ~2s)
             audio_wav = work / "speech.wav"
             (
                 ffmpeg.input(audio_path)
@@ -258,103 +473,59 @@ class SyncNetPipeline:
                 .run()
             )
 
-            # 4) Face detection
-            detections = []
-            for i, fp in enumerate(frames):
-                img = cv2.imread(fp)
-                boxes = (
-                    self.s3fd.detect_faces(
-                        cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
-                        conf_th=0.9,
-                        scales=[cfg.facedet_scale],
-                    )
-                    if img is not None
-                    else []
-                )
-                detections.append(
-                    [
-                        {"frame": i, "bbox": b[:-1].tolist(), "conf": float(b[-1])}
-                        for b in boxes
-                    ]
-                )
-
             flat = [f for fs in detections for f in fs]
             s3fd_json = json.dumps(flat) if flat else ""
             has_face = bool(flat)
 
-            # 5) Scene detection
-            vm = VideoManager([str(avi)])
-            sm = SceneManager(StatsManager())
-            sm.add_detector(ContentDetector())
-            vm.start()
-            sm.detect_scenes(frame_source=vm)
-            scenes = sm.get_scene_list(vm.get_base_timecode()) or [
-                (vm.get_base_timecode(), vm.get_current_timecode())
-            ]
+            # 5) Scene detection (optional, disabled by default for performance)
+            if self.cfg.enable_scene_detection:
+                vm = VideoManager([str(avi)])
+                sm = SceneManager(StatsManager())
+                sm.add_detector(ContentDetector())
+                vm.start()
+                sm.detect_scenes(frame_source=vm)
+                scenes = sm.get_scene_list(vm.get_base_timecode()) or [
+                    (vm.get_base_timecode(), vm.get_current_timecode())
+                ]
+            else:
+                # Treat entire video as single scene for faster processing
+                # Face tracking will naturally segment at hard cuts via IoU threshold
+                # Create simple frame range without using VideoManager
+                scenes = None
 
             # 6) Track faces
             tracks = []
-            for sc in scenes:
-                s, e = sc[0].frame_num, sc[1].frame_num
-                if e - s >= cfg.min_track:
-                    tracks.extend(self._track([lst.copy() for lst in detections[s:e]]))
+            if self.cfg.enable_scene_detection and scenes:
+                for sc in scenes:
+                    s, e = sc[0].frame_num, sc[1].frame_num
+                    if e - s >= cfg.min_track:
+                        tracks.extend(self._track([lst.copy() for lst in detections[s:e]]))
+            else:
+                # Process entire video as one scene
+                if len(detections) >= cfg.min_track:
+                    tracks.extend(self._track([lst.copy() for lst in detections]))
 
-            # 7) Crop tracks
-            crops = [
-                self._crop(t, frames, str(audio_wav), Path(work) / "cropped" / f"{i:05d}") for i, t in enumerate(tracks)
-            ]
-            # AV offset:      5
-            # Min dist:       5.370
-            # Confidence:     9.892
-
-            # crops = [work / ".." / ".."/ "data" / "example.avi"]
-            # AV offset:      3
-            # Min dist:       5.348
-            # Confidence:     10.081
-            
-            # crops = [work / "video.avi"]
-            # AV offset:      3
-            # Min dist:       6.668
-            # Confidence:     8.337
-
-            # 8) SyncNet evaluation
+            # 7-8) OPTIMIZED: In-memory crop and evaluation (no disk I/O for cropped frames)
             offsets, confs, dists = [], [], []
-            class Opt: ...
-            for i, cp in enumerate(crops):
-                crop_dir = work / "cropped" / f"crop_{i:05d}"
-                frames_dir = crop_dir
-                frames_dir.mkdir(parents=True, exist_ok=True)
-                audio_path = crop_dir / "audio.wav"
 
-                # Extract frames
-                (
-                    ffmpeg.input(cp)
-                    .output(str(frames_dir / "%06d.jpg"), f="image2", threads=1)
-                    .overwrite_output()
-                    .run()
-                )
-                
-                # Extract audio
-                (
-                    ffmpeg.input(cp)
-                    .output(
-                        str(audio_path),
-                        ac=1,
-                        vn=None,
-                        acodec="pcm_s16le",
-                        ar=16000,
-                        af="aresample=async=1",
-                    )
-                    .overwrite_output()
-                    .run()
-                )
+            for i, track in enumerate(tracks):
+                # Get in-memory crop data (no file writes)
+                crop_data = self._crop_streaming(track, video_path, audio_wav)
 
+                # Create opt object for SyncNet
+                class Opt: ...
                 opt = Opt()
-                opt.tmp_dir = str(crop_dir)
                 opt.batch_size = cfg.batch_size
                 opt.vshift = cfg.vshift
 
-                off, conf, dist = self.syncnet.evaluate(opt=opt)
+                # Pass directly to SyncNet (no file I/O)
+                off, conf, dist = self.syncnet.evaluate_from_memory(
+                    frames=crop_data['frames'],
+                    audio=crop_data['audio'],
+                    sample_rate=crop_data['sample_rate'],
+                    opt=opt
+                )
+
                 offsets.append(off)
                 confs.append(conf)
                 dists.append(dist)
