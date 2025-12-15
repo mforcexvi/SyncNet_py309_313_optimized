@@ -110,10 +110,10 @@ class S3FD:
                     img_t = img_t.permute(2, 0, 1)  # HWC -> CHW
 
                 # RGB to BGR, normalize, and back to RGB (matching original code)
-                img_t = img_t[[2, 1, 0], :, :]  # RGB -> BGR
+                img_t = img_t[[2, 1, 0]]  # RGB -> BGR (proper PyTorch indexing)
                 img_mean_tensor = torch.from_numpy(img_mean)
-                img_t -= img_mean_tensor
-                img_t = img_t[[2, 1, 0], :, :]  # BGR -> RGB
+                img_t = img_t - img_mean_tensor  # Subtract mean
+                img_t = img_t[[2, 1, 0]]  # BGR -> RGB
 
                 batch_tensors.append(img_t)
 
