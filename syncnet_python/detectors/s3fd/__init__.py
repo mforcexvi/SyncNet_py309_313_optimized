@@ -93,28 +93,25 @@ class S3FD:
             for img in images_batch:
                 original_shapes.append((img.shape[1], img.shape[0]))  # (w, h)
 
-                # Convert to torch tensor on CPU
-                img_t = torch.from_numpy(img).float()
+                # Do ALL preprocessing in numpy (matching original detect_faces exactly)
+                processed = img.copy()
 
-                # Resize if needed
+                # Resize if needed (use cv2, not torch)
                 if scale != 1.0:
                     new_h = int(img.shape[0] * scale)
                     new_w = int(img.shape[1] * scale)
-                    img_t = F.interpolate(
-                        img_t.permute(2, 0, 1).unsqueeze(0),
-                        size=(new_h, new_w),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0)
-                else:
-                    img_t = img_t.permute(2, 0, 1)  # HWC -> CHW
+                    processed = cv2.resize(processed, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-                # RGB to BGR, normalize, and back to RGB (matching original code)
-                img_t = img_t[[2, 1, 0]]  # RGB -> BGR (proper PyTorch indexing)
-                img_mean_tensor = torch.from_numpy(img_mean)
-                img_t = img_t - img_mean_tensor  # Subtract mean
-                img_t = img_t[[2, 1, 0]]  # BGR -> RGB
+                # Match original preprocessing exactly (lines 43-48 of detect_faces method)
+                processed = np.swapaxes(processed, 1, 2)
+                processed = np.swapaxes(processed, 1, 0)
+                processed = processed[[2, 1, 0], :, :]  # RGB to BGR (numpy indexing)
+                processed = processed.astype("float32")
+                processed -= img_mean  # Subtract mean (numpy operation)
+                processed = processed[[2, 1, 0], :, :]  # BGR back to RGB (numpy indexing)
 
+                # NOW convert to torch (matching line 49 of detect_faces)
+                img_t = torch.from_numpy(processed)
                 batch_tensors.append(img_t)
 
             # Stack on CPU then move to GPU (more memory efficient)
