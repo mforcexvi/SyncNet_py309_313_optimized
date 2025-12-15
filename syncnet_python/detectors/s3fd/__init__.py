@@ -84,15 +84,16 @@ class S3FD:
         if not images_batch:
             return []
 
-        batch_tensors = []
         original_shapes = []
 
         with torch.no_grad():
-            # Batch preprocessing
+            # Batch preprocessing - process on CPU first to save GPU memory
+            batch_tensors = []
+
             for img in images_batch:
                 original_shapes.append((img.shape[1], img.shape[0]))  # (w, h)
 
-                # Convert to torch tensor
+                # Convert to torch tensor on CPU
                 img_t = torch.from_numpy(img).float()
 
                 # Resize if needed
@@ -110,17 +111,24 @@ class S3FD:
 
                 # RGB to BGR, normalize, and back to RGB (matching original code)
                 img_t = img_t[[2, 1, 0], :, :]  # RGB -> BGR
-                img_mean_tensor = torch.from_numpy(img_mean).to(img_t.device)
-                img_t -= img_mean_tensor
+                img_mean_tensor = torch.from_numpy(img_mean)
+                img_t -= torch.from_numpy(img_mean_tensor)
                 img_t = img_t[[2, 1, 0], :, :]  # BGR -> RGB
 
                 batch_tensors.append(img_t)
 
-            # Stack to [B, 3, H, W] and move to GPU
-            x_batch = torch.stack(batch_tensors).to(self.device)
+            # Stack on CPU then move to GPU (more memory efficient)
+            x_batch = torch.stack(batch_tensors)
+            del batch_tensors  # Free CPU memory
+
+            # Move to GPU just before inference
+            x_batch = x_batch.to(self.device)
 
             # Single forward pass for entire batch
             y = self.net(x_batch)
+
+            # Free input batch memory immediately
+            del x_batch
 
             # Extract detections for each image in batch
             all_detections = []
@@ -134,14 +142,12 @@ class S3FD:
                 # Extract detections for this image
                 for det_idx in range(detections_batch.size(1)):
                     j = 0
-                    while detections_batch[i, det_idx, j, 0] > conf_th:
+                    while j < detections_batch.size(2) and detections_batch[i, det_idx, j, 0] > conf_th:
                         score = detections_batch[i, det_idx, j, 0].item()
                         pt = (detections_batch[i, det_idx, j, 1:] * scale_tensor).cpu().numpy()
                         bbox = (pt[0], pt[1], pt[2], pt[3], score)
                         bboxes = np.vstack((bboxes, bbox))
                         j += 1
-                        if j >= detections_batch.size(2):
-                            break
 
                 # Apply NMS
                 if len(bboxes) > 0:
@@ -149,5 +155,8 @@ class S3FD:
                     bboxes = bboxes[keep]
 
                 all_detections.append(bboxes)
+
+            # Free detection results from GPU
+            del detections_batch, y
 
         return all_detections

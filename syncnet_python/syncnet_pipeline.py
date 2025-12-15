@@ -142,38 +142,60 @@ class SyncNetPipeline:
         areaB = (b[2] - b[0]) * (b[3] - b[1])
         return inter / (areaA + areaB - inter + 1e-8)
 
-    def _calculate_optimal_batch_size(self, frame_shape, target_memory_gb=4.0):
+    def _calculate_optimal_batch_size(self, frame_shape, target_memory_gb=2.0):
         """
         Calculate optimal batch size based on available GPU memory
 
         Args:
             frame_shape: (H, W, C) of detection frames
-            target_memory_gb: Max GPU memory to use for batch
+            target_memory_gb: Max GPU memory to use for batch (conservative default)
 
         Returns:
             Optimal batch size
         """
         if not torch.cuda.is_available():
-            return 32  # Default for CPU
+            return 16  # Default for CPU (reduced from 32)
 
-        # Get available GPU memory
-        gpu_props = torch.cuda.get_device_properties(0)
-        total_memory = gpu_props.total_memory / (1024**3)  # GB
-        allocated = torch.cuda.memory_allocated(0) / (1024**3)
-        available = total_memory - allocated
+        try:
+            # Clear cache and get fresh memory stats
+            torch.cuda.empty_cache()
 
-        # Estimate memory per frame (input + feature maps)
-        h, w, c = frame_shape
-        bytes_per_frame = h * w * c * 4  # float32
-        # S3FD feature maps are ~5-8x input size
-        estimated_per_frame = bytes_per_frame * 8 / (1024**3)  # GB
+            gpu_props = torch.cuda.get_device_properties(0)
+            total_memory = gpu_props.total_memory / (1024**3)  # GB
+            allocated = torch.cuda.memory_allocated(0) / (1024**3)
+            reserved = torch.cuda.memory_reserved(0) / (1024**3)
 
-        # Use 70% of available memory as safety margin
-        safe_memory = min(available * 0.7, target_memory_gb)
-        optimal_batch = int(safe_memory / estimated_per_frame)
+            # Use reserved memory as baseline (accounts for S3FD model)
+            available = total_memory - reserved
 
-        # Clamp between reasonable bounds
-        return max(8, min(optimal_batch, 200))
+            logging.info(
+                f"GPU Memory: {total_memory:.2f}GB total, "
+                f"{reserved:.2f}GB reserved, {available:.2f}GB available"
+            )
+
+            # Estimate memory per frame (input + feature maps)
+            h, w, c = frame_shape
+            bytes_per_frame = h * w * c * 4  # float32
+            # S3FD feature maps are ~10-15x input size (more conservative estimate)
+            estimated_per_frame = bytes_per_frame * 15 / (1024**3)  # GB
+
+            # Use only 40% of available memory as safety margin (more conservative)
+            safe_memory = min(available * 0.4, target_memory_gb)
+            optimal_batch = int(safe_memory / estimated_per_frame)
+
+            # Clamp between reasonable bounds (reduced max from 200 to 64)
+            batch_size = max(4, min(optimal_batch, 64))
+
+            logging.info(
+                f"Calculated batch size: {batch_size} "
+                f"(estimated {estimated_per_frame*1024:.1f}MB per frame)"
+            )
+
+            return batch_size
+
+        except Exception as e:
+            logging.warning(f"Error calculating batch size: {e}, using default of 8")
+            return 8
 
     def _track(self, dets):
         cfg = self.cfg
@@ -394,6 +416,54 @@ class SyncNetPipeline:
         frame_indices = []
         frame_idx = 0
 
+        def process_batch(buffer, indices):
+            """Helper to process a batch of frames with OOM handling"""
+            nonlocal batch_size
+
+            try:
+                if hasattr(self.s3fd, 'detect_faces_batch'):
+                    boxes_batch = self.s3fd.detect_faces_batch(
+                        buffer,
+                        conf_th=0.9,
+                        scale=1.0  # Already downscaled
+                    )
+                else:
+                    # Fallback to sequential detection
+                    boxes_batch = [
+                        self.s3fd.detect_faces(img, conf_th=0.9, scales=[1.0])
+                        for img in buffer
+                    ]
+
+                # Clear GPU cache after batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                return boxes_batch
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    # OOM - reduce batch size and retry
+                    logging.warning(f"OOM with batch size {batch_size}, reducing to {batch_size//2}")
+                    batch_size = max(1, batch_size // 2)
+
+                    # Clear cache and retry with smaller batches
+                    torch.cuda.empty_cache()
+
+                    # Process in smaller sub-batches
+                    boxes_batch = []
+                    for i in range(0, len(buffer), batch_size):
+                        sub_batch = buffer[i:i+batch_size]
+                        if hasattr(self.s3fd, 'detect_faces_batch'):
+                            boxes = self.s3fd.detect_faces_batch(sub_batch, conf_th=0.9, scale=1.0)
+                        else:
+                            boxes = [self.s3fd.detect_faces(img, conf_th=0.9, scales=[1.0]) for img in sub_batch]
+                        boxes_batch.extend(boxes)
+                        torch.cuda.empty_cache()
+
+                    return boxes_batch
+                else:
+                    raise
+
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -415,19 +485,7 @@ class SyncNetPipeline:
 
             # Process batch when full or at end
             if len(frame_buffer) >= batch_size:
-                # Batch detection
-                if hasattr(self.s3fd, 'detect_faces_batch'):
-                    boxes_batch = self.s3fd.detect_faces_batch(
-                        frame_buffer,
-                        conf_th=0.9,
-                        scale=1.0  # Already downscaled
-                    )
-                else:
-                    # Fallback to sequential detection
-                    boxes_batch = [
-                        self.s3fd.detect_faces(img, conf_th=0.9, scales=[1.0])
-                        for img in frame_buffer
-                    ]
+                boxes_batch = process_batch(frame_buffer, frame_indices)
 
                 # Scale boxes back to original resolution and store
                 for fidx, boxes in zip(frame_indices, boxes_batch):
@@ -447,17 +505,7 @@ class SyncNetPipeline:
 
         # Process remaining frames
         if frame_buffer:
-            if hasattr(self.s3fd, 'detect_faces_batch'):
-                boxes_batch = self.s3fd.detect_faces_batch(
-                    frame_buffer,
-                    conf_th=0.9,
-                    scale=1.0
-                )
-            else:
-                boxes_batch = [
-                    self.s3fd.detect_faces(img, conf_th=0.9, scales=[1.0])
-                    for img in frame_buffer
-                ]
+            boxes_batch = process_batch(frame_buffer, frame_indices)
 
             for fidx, boxes in zip(frame_indices, boxes_batch):
                 if len(boxes) > 0:
@@ -472,6 +520,11 @@ class SyncNetPipeline:
                     detections.append([])
 
         cap.release()
+
+        # Final cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return detections
 
     # ---------------------------- inference -------------------------------- #
@@ -486,6 +539,11 @@ class SyncNetPipeline:
         work = Path(cache_dir) if cache_dir else Path(tempfile.mkdtemp())
         if cache_dir:
             work.mkdir(parents=True, exist_ok=True)
+
+        # Clear GPU memory before starting
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logging.info("Cleared GPU cache before inference")
 
         try:
             # 1-4) OPTIMIZED: Streaming face detection (replaces AVI conversion, frame extraction, and face detection)
