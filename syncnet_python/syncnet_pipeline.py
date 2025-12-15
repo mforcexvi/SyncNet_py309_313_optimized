@@ -48,8 +48,8 @@ class PipelineConfig:
     vshift: int = 15
 
     # Local weight paths
-    s3fd_weights: str = "sfd_face.pth"
-    syncnet_weights: str = "syncnet_v2.model"
+    s3fd_weights: str = "weights/sfd_face.pth"
+    syncnet_weights: str = "weights/syncnet_v2.model"
 
     # Tools
     ffmpeg_bin: str = "ffmpeg"  # assumes ffmpeg in $PATH
@@ -92,15 +92,43 @@ class SyncNetPipeline:
     # ---------------------------- model loading ---------------------------- #
     def _load_s3fd(self, path: str) -> S3FD:
         logging.info(f"Loading S3FD from {path}")
+        if not Path(path).exists():
+            raise FileNotFoundError(
+                f"S3FD weights not found at: {path}\n"
+                f"Please ensure the weights file exists at this location."
+            )
+
         net = S3FDNet(device=self.device)
-        net.load_state_dict(torch.load(path, map_location=self.device))
+        try:
+            state_dict = torch.load(path, map_location=self.device)
+            net.load_state_dict(state_dict, strict=False)
+            logging.info(f"Successfully loaded S3FD weights from {path}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load S3FD weights from {path}: {e}\n"
+                f"Please ensure the weights file is compatible with S3FDNet architecture."
+            )
         net.eval()
         return S3FD(net=net, device=self.device)
 
     def _load_syncnet(self, path: str) -> SyncNetInstance:
         logging.info(f"Loading SyncNet from {path}")
+        if not Path(path).exists():
+            raise FileNotFoundError(
+                f"SyncNet weights not found at: {path}\n"
+                f"Please ensure the weights file exists at this location."
+            )
+
         model = S()
-        model.load_state_dict(torch.load(path, map_location=self.device))
+        try:
+            state_dict = torch.load(path, map_location=self.device)
+            model.load_state_dict(state_dict, strict=False)
+            logging.info(f"Successfully loaded SyncNet weights from {path}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load SyncNet weights from {path}: {e}\n"
+                f"Please ensure the weights file is compatible with SyncNet architecture."
+            )
         model.eval()
         return SyncNetInstance(net=model, device=self.device)
 
